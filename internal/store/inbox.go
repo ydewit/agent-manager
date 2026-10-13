@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -238,6 +239,105 @@ SELECT id, sender_id, sender_name, body, fingerprint, sent_at, claimed_at
 	return msg, true, nil
 }
 
+func (s *Store) HeadMessages(sessionID string, limit int) ([]InboxMessage, error) {
+	rows, err := s.db.Query(`
+SELECT id, sender_id, sender_name, body, fingerprint, sent_at, claimed_at
+  FROM session_inbox
+ WHERE session_id = ? AND delivered_at = 0
+ ORDER BY id LIMIT ?`, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var messages []InboxMessage
+	for rows.Next() {
+		msg := InboxMessage{SessionID: sessionID}
+		var sentAt, claimedAt int64
+		if err := rows.Scan(&msg.ID, &msg.SenderID, &msg.SenderName, &msg.Body, &msg.Fingerprint, &sentAt, &claimedAt); err != nil {
+			return nil, err
+		}
+		msg.SentAt, msg.ClaimedAt = decodeTime(sentAt), decodeTime(claimedAt)
+		messages = append(messages, msg)
+	}
+	return messages, rows.Err()
+}
+
+// ClaimMessages takes the exact unclaimed FIFO prefix in one transaction.
+// Another poller can win, while a concurrent append does not disturb it.
+func (s *Store) ClaimMessages(sessionID string, ids []int64, at time.Time) (bool, error) {
+	if len(ids) == 0 {
+		return false, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query(`SELECT id, claimed_at FROM session_inbox
+ WHERE session_id = ? AND delivered_at = 0 ORDER BY id LIMIT ?`, sessionID, len(ids))
+	if err != nil {
+		return false, err
+	}
+	index := 0
+	for rows.Next() {
+		var id, claimedAt int64
+		if err := rows.Scan(&id, &claimedAt); err != nil {
+			rows.Close()
+			return false, err
+		}
+		if id != ids[index] || claimedAt != 0 {
+			rows.Close()
+			return false, nil
+		}
+		index++
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil || index != len(ids) {
+		return false, err
+	}
+	args := []any{encodeTime(at)}
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	query := `UPDATE session_inbox SET claimed_at = ? WHERE id IN (` +
+		strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",") + `)`
+	if _, err := tx.Exec(query, args...); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) MarkMessagesDelivered(ids []int64, at time.Time) error {
+	return s.markMessages(ids, at, false)
+}
+
+func (s *Store) MarkMessagesDropped(ids []int64, at time.Time) error {
+	return s.markMessages(ids, at, true)
+}
+
+func (s *Store) markMessages(ids []int64, at time.Time, dropped bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	stamp := encodeTime(at)
+	var droppedAt int64
+	if dropped {
+		droppedAt = stamp
+	}
+	args := []any{stamp, droppedAt}
+	for _, id := range ids {
+		args = append(args, id)
+	}
+	query := `UPDATE session_inbox SET delivered_at = ?, dropped_at = ?
+ WHERE delivered_at = 0 AND id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",") + `)`
+	_, err := s.db.Exec(query, args...)
+	return err
+}
+
 // ClaimMessage takes ownership of one message before it is typed. A
 // concurrent append cannot invalidate this compare-and-set the way it can
 // invalidate the pending-input one, because the guard is a single row.
@@ -253,10 +353,7 @@ func (s *Store) ClaimMessage(id int64, at time.Time) (bool, error) {
 }
 
 func (s *Store) MarkDelivered(id int64, at time.Time) error {
-	_, err := s.db.Exec(
-		`UPDATE session_inbox SET delivered_at = ? WHERE id = ? AND delivered_at = 0`,
-		encodeTime(at), id)
-	return err
+	return s.MarkMessagesDelivered([]int64{id}, at)
 }
 
 // MarkDropped retires a message that never reached the pane. It leaves the
@@ -264,11 +361,7 @@ func (s *Store) MarkDelivered(id int64, at time.Time) error {
 // nothing may retype it, and dropped_at is what tells its sender the
 // difference.
 func (s *Store) MarkDropped(id int64, at time.Time) error {
-	stamp := encodeTime(at)
-	_, err := s.db.Exec(
-		`UPDATE session_inbox SET delivered_at = ?, dropped_at = ? WHERE id = ? AND delivered_at = 0`,
-		stamp, stamp, id)
-	return err
+	return s.MarkMessagesDropped([]int64{id}, at)
 }
 
 // MarkRead acks every message a session received from one sender. A reply

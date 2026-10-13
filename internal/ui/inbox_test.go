@@ -1,7 +1,11 @@
 package ui
 
 import (
+	"database/sql"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -11,6 +15,7 @@ import (
 	"github.com/YoanWai/agent-manager/internal/mcpreg"
 	"github.com/YoanWai/agent-manager/internal/status"
 	"github.com/YoanWai/agent-manager/internal/store"
+	"github.com/YoanWai/agent-manager/internal/tmux"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -159,6 +164,124 @@ func TestInboxDeliversToARestingAgentWithItsSenderNamed(t *testing.T) {
 	// claude-hooked registers no MCP server, so the reply it is sent after is
 	// the subcommand.
 	settledPane(t, m, sess.ID, "rebase on main", "ordinary work", "payments-fix", "agent-manager send sender01")
+}
+
+func TestInboxDeliversQueuedMessagesInOneTurn(t *testing.T) {
+	m := buildModel(t)
+	sess := spawnedSession(t, m, "ready-tool")
+	settledPane(t, m, sess.ID, "❯")
+	bodies := []string{"first queued request", "second queued request", "third queued request"}
+	ids := make([]int64, len(bodies))
+	for i, body := range bodies {
+		ids[i] = queueMessage(t, m, sess.ID, body)
+	}
+	delivered, err := m.poller.maybeDeliverInbox(sess, "❯ ", status.Idle, true)
+	if err != nil || !delivered {
+		t.Fatalf("delivery = %v, err %v", delivered, err)
+	}
+	if queued, _ := m.store.QueuedCount(sess.ID); queued != 0 {
+		t.Fatalf("%d requests still require another agent turn", queued)
+	}
+	for _, id := range ids {
+		msg, err := m.store.Message(id, "sender01")
+		if err != nil || msg.DeliveredAt.IsZero() || !msg.DroppedAt.IsZero() {
+			t.Fatalf("message %d delivery = %+v, err %v", id, msg, err)
+		}
+	}
+	settledPane(t, m, sess.ID, bodies[len(bodies)-1])
+	pane, err := m.tmux.CapturePaneHistory(sess.ID, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pane = strings.ReplaceAll(pane, "\n", "")
+	previous := -1
+	for _, body := range bodies {
+		index := strings.Index(pane, body)
+		if index <= previous {
+			t.Fatalf("messages are not in FIFO order:\n%s", pane)
+		}
+		previous = index
+	}
+}
+
+func TestInboxBatchIsBoundedAndKeepsCompleteFIFOEnvelopes(t *testing.T) {
+	var messages []store.InboxMessage
+	for i := 1; i <= 10; i++ {
+		messages = append(messages, store.InboxMessage{
+			ID: int64(i), SenderID: fmt.Sprintf("sender%d", i), SenderName: fmt.Sprintf("worker%d", i),
+			Body: fmt.Sprintf("request%d:", i) + strings.Repeat("x", 2000), SentAt: time.Now(),
+		})
+	}
+	batch := buildInboxDelivery(messages, "claude", func(string) bool { return false })
+	if len(batch.ids) < 2 || len(batch.ids) >= len(messages) || len(batch.text) > inboxBatchBytes {
+		t.Fatalf("batch count=%d bytes=%d", len(batch.ids), len(batch.text))
+	}
+	for i, id := range batch.ids {
+		if id != messages[i].ID || !strings.Contains(batch.text, messages[i].Body) {
+			t.Fatalf("message %d was reordered or truncated", id)
+		}
+	}
+	if strings.Contains(batch.text, fmt.Sprintf("request%d:", len(batch.ids)+1)) {
+		t.Fatal("the next queued request partially entered the batch")
+	}
+}
+
+func TestInboxBatchPreservesMixedSenderEnvelopesAndStopsAtAClaim(t *testing.T) {
+	now := time.Now()
+	messages := []store.InboxMessage{
+		{ID: 1, SenderID: "agent01", SenderName: "author", Body: "agent request", SentAt: now},
+		{ID: 2, SenderID: "shell01", SenderName: "terminal", Body: "terminal request", SentAt: now},
+		{ID: 3, SenderID: "later01", SenderName: "other", Body: "held request", SentAt: now, ClaimedAt: now},
+		{ID: 4, SenderID: "later02", SenderName: "other", Body: "later request", SentAt: now},
+	}
+	batch := buildInboxDelivery(messages, "claude", func(id string) bool { return id == "shell01" })
+	if len(batch.ids) != 2 || batch.ids[0] != 1 || batch.ids[1] != 2 {
+		t.Fatalf("batch IDs = %v", batch.ids)
+	}
+	for _, expected := range []string{"agent request", "terminal request", "another of the user's agent sessions", "one of the user's terminals", `session_id "agent01"`} {
+		if !strings.Contains(batch.text, expected) {
+			t.Fatalf("batch lost %q", expected)
+		}
+	}
+	for _, unwanted := range []string{`session_id "shell01"`, "held request", "later request"} {
+		if strings.Contains(batch.text, unwanted) {
+			t.Fatalf("batch included %q", unwanted)
+		}
+	}
+}
+
+func TestInboxBatchKeepsReplyRoutingForEveryShippedCLI(t *testing.T) {
+	cfg, err := config.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := []store.InboxMessage{
+		{ID: 1, SenderID: "author01", SenderName: "author", Body: "first request", SentAt: time.Now()},
+		{ID: 2, SenderID: "review01", SenderName: "reviewer", Body: "second request", SentAt: time.Now()},
+	}
+	for _, name := range cfg.AgentToolNames() {
+		t.Run(name, func(t *testing.T) {
+			tool := cfg.Tools[name]
+			style := mcpreg.Style(name, tool.MCP)
+			batch := buildInboxDelivery(messages, style, func(string) bool { return false })
+			if len(batch.ids) != 2 || strings.Count(batch.text, "[agent-manager] Message from") != 2 {
+				t.Fatalf("missing sender envelopes: %s", batch.text)
+			}
+			for _, msg := range messages {
+				reply := `send_session tool, session_id "` + msg.SenderID + `"`
+				if style == mcpreg.StyleNone {
+					reply = "agent-manager send " + msg.SenderID
+				}
+				if !strings.Contains(batch.text, reply) {
+					t.Fatalf("missing reply route %q: %s", reply, batch.text)
+				}
+			}
+			single := buildInboxDelivery(messages[:1], style, func(string) bool { return false })
+			if strings.Contains(single.text, "queued messages follow") || single.prompt != messages[0].Body {
+				t.Fatalf("single message changed: %+v", single)
+			}
+		})
+	}
 }
 
 // A script in a terminal messaging agents is a caller like any other, but
@@ -503,6 +626,7 @@ func TestInboxLeavesAClaimAnotherManagerIsStillPasting(t *testing.T) {
 func TestInboxHoldsAMessageWhileSomeoneIsTypingAtThePrompt(t *testing.T) {
 	m := buildModel(t)
 	sess := spawnedSession(t, m, "ready-tool")
+	settledPane(t, m, sess.ID, "❯")
 	queueMessage(t, m, sess.ID, "rebase on main")
 	if err := m.tmux.Paste(sess.ID, "USERTEXT-in-progress"); err != nil {
 		t.Fatalf("paste: %v", err)
@@ -557,6 +681,31 @@ func TestInboxRecordsAMessageItCouldNotTypeAsDropped(t *testing.T) {
 	}
 	if queued, _ := m.store.QueuedCount(sess.ID); queued != 0 {
 		t.Fatal("a dropped message was left to be retried")
+	}
+}
+
+func TestInboxFailedBatchMarksEveryReceiptDropped(t *testing.T) {
+	m := buildModel(t)
+	sess := spawnedSession(t, m, "ready-tool")
+	settledPane(t, m, sess.ID, "❯")
+	var ids []int64
+	for _, body := range []string{"first", "second", "third"} {
+		ids = append(ids, queueMessage(t, m, sess.ID, body))
+	}
+	if err := m.tmux.Kill(sess.ID); err != nil {
+		t.Fatal(err)
+	}
+	if delivered, err := m.poller.maybeDeliverInbox(sess, "❯ ", status.Idle, true); err == nil || delivered {
+		t.Fatalf("failed batch delivered=%v, err=%v", delivered, err)
+	}
+	for _, id := range ids {
+		msg, err := m.store.Message(id, "sender01")
+		if err != nil || msg.DroppedAt.IsZero() {
+			t.Fatalf("failed receipt %d = %+v, err=%v", id, msg, err)
+		}
+	}
+	if queued, err := m.store.QueuedCount(sess.ID); err != nil || queued != 0 {
+		t.Fatalf("failed batch remained retryable: queued=%d, err=%v", queued, err)
 	}
 }
 
@@ -780,22 +929,9 @@ func containsAll(pane string, markers []string) bool {
 func TestThePollLoopDeliversQueuedMessagesOldestFirst(t *testing.T) {
 	m := buildModel(t)
 	sess := spawnedSession(t, m, "ready-tool")
+	settledPane(t, m, sess.ID, "❯")
 	first := queueMessage(t, m, sess.ID, "rebase on main")
 	second := queueMessage(t, m, sess.ID, "then push the branch")
-
-	pollUntilQueued(t, m, sess.ID, 1)
-	head, queued, err := m.store.HeadMessage(sess.ID)
-	if err != nil || !queued {
-		t.Fatalf("HeadMessage: %v, queued=%v", err, queued)
-	}
-	if head.ID != second {
-		t.Fatalf("the newer message was delivered first: head = %+v", head)
-	}
-	// Prove the oldest body rendered while it is still the only one on the
-	// pane. Once the second envelope lands it scrolls off, and the store's
-	// delivery stamp alone would not tell a delivered paste from one that
-	// never reached the composer.
-	settledPane(t, m, sess.ID, "rebase on main")
 
 	pollUntilQueued(t, m, sess.ID, 0)
 	for _, id := range []int64{first, second} {
@@ -807,10 +943,16 @@ func TestThePollLoopDeliversQueuedMessagesOldestFirst(t *testing.T) {
 			t.Fatalf("message %d never reached the pane: %+v", id, state)
 		}
 	}
-	// The fixture draws a fresh prompt per line it reads, so two envelopes
-	// overflow the pane and the first body has scrolled off by now; it was
-	// asserted above while it was still visible.
 	settledPane(t, m, sess.ID, "then push the branch")
+	pane, err := m.tmux.CapturePaneHistory(sess.ID, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flat := strings.ReplaceAll(pane, "\n", "")
+	firstAt, secondAt := strings.Index(flat, "rebase on main"), strings.Index(flat, "then push the branch")
+	if firstAt < 0 || secondAt <= firstAt {
+		t.Fatalf("FIFO bodies did not reach the pane:\n%s", pane)
+	}
 }
 
 // A message typed a second time runs the same instruction twice, so the
@@ -851,5 +993,200 @@ func TestInboxDeliversWhenARuleReportsARestingState(t *testing.T) {
 	}
 	if queued, _ := m.store.QueuedCount(sess.ID); queued != 0 {
 		t.Fatal("a resting rule state blocked delivery for good")
+	}
+}
+
+func TestInboxDoesNotDeliverANewHeadAfterAnotherManagerWins(t *testing.T) {
+	m := buildModel(t)
+	sess := spawnedSession(t, m, "ready-tool")
+	settledPane(t, m, sess.ID, "❯")
+	first := queueMessage(t, m, sess.ID, "already taken by another manager")
+	second := queueMessage(t, m, sess.ID, "must wait for the new turn")
+	realTmux, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	entered, release := filepath.Join(dir, "entered"), filepath.Join(dir, "release")
+	script := "#!/bin/sh\ncase \" $* \" in *'#{cursor_x},#{cursor_y}'*) touch " + tmux.ShellQuote(entered) + "; i=0; while [ ! -f " + tmux.ShellQuote(release) + " ] && [ $i -lt 500 ]; do sleep 0.01; i=$((i+1)); done ;; esac\nexec " + tmux.ShellQuote(realTmux) + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	driver, err := tmux.NewWithSocket(m.tmux.SocketName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.poller.tmux = driver
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+	type result struct {
+		delivered bool
+		err       error
+	}
+	done := make(chan result, 1)
+	go func() {
+		ok, err := m.poller.maybeDeliverInbox(sess, "❯ ", status.Idle, true)
+		done <- result{ok, err}
+	}()
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		if _, err := os.Stat(entered); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cursor boundary was not reached")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if ok, err := m.store.ClaimMessage(first, time.Now()); err != nil || !ok {
+		t.Fatalf("other claim = %v, %v", ok, err)
+	}
+	if err := m.store.MarkDelivered(first, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil || got.delivered {
+			t.Fatalf("new head delivered on stale holds: %+v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("delivery did not finish")
+	}
+	msg, err := m.store.Message(second, "sender01")
+	if err != nil || !msg.ClaimedAt.IsZero() || !msg.DeliveredAt.IsZero() {
+		t.Fatalf("new head changed: %+v, %v", msg, err)
+	}
+}
+
+func TestInboxRetiresTheWholeStaleRunInOnePass(t *testing.T) {
+	m := buildModel(t)
+	sess := spawnedSession(t, m, "ready-tool")
+	settledPane(t, m, sess.ID, "❯")
+	var stale []int64
+	for _, body := range []string{"stale one", "stale two", "stale three"} {
+		stale = append(stale, queueMessage(t, m, sess.ID, body))
+	}
+	fresh := queueMessage(t, m, sess.ID, "fresh claim")
+	later := queueMessage(t, m, sess.ID, "later unclaimed")
+	at := time.Now().Add(-inboxClaimGrace - time.Second)
+	if ok, err := m.store.ClaimMessages(sess.ID, stale, at); err != nil || !ok {
+		t.Fatalf("stale claim = %v, %v", ok, err)
+	}
+	if ok, err := m.store.ClaimMessage(fresh, time.Now()); err != nil || !ok {
+		t.Fatalf("fresh claim = %v, %v", ok, err)
+	}
+	if delivered, err := m.poller.maybeDeliverInbox(sess, "❯ ", status.Idle, true); err == nil || delivered {
+		t.Fatalf("stale cleanup = %v, %v", delivered, err)
+	}
+	for _, id := range stale {
+		msg, err := m.store.Message(id, "sender01")
+		if err != nil || msg.DroppedAt.IsZero() {
+			t.Fatalf("stale receipt %d not retired: %+v, %v", id, msg, err)
+		}
+	}
+	for _, id := range []int64{fresh, later} {
+		msg, err := m.store.Message(id, "sender01")
+		if err != nil || !msg.DroppedAt.IsZero() || !msg.DeliveredAt.IsZero() {
+			t.Fatalf("nonstale receipt changed: %+v, %v", msg, err)
+		}
+	}
+	if queued, err := m.store.QueuedCount(sess.ID); err != nil || queued != 2 {
+		t.Fatalf("queued=%d, %v", queued, err)
+	}
+}
+
+func TestInboxMultiMessagePasteStaysWithinSingleMessageScale(t *testing.T) {
+	var msgs []store.InboxMessage
+	for i := 0; i < 10; i++ {
+		msgs = append(msgs, store.InboxMessage{ID: int64(i + 1), SenderID: "sender01", SenderName: "author", Body: strings.Repeat("x", 2000), SentAt: time.Now()})
+	}
+	batch := buildInboxDelivery(msgs, "claude", func(string) bool { return false })
+	if len(batch.ids) < 2 || len(batch.text) > 8*1024 {
+		t.Fatalf("batch count=%d bytes=%d; ordinary multi-message paste exceeds8KiB", len(batch.ids), len(batch.text))
+	}
+}
+
+func TestInboxOversizedHeadIsSentWholeAndAlone(t *testing.T) {
+	body := strings.Repeat("x", 8000)
+	msgs := []store.InboxMessage{{ID: 1, SenderID: "sender01", SenderName: "author", Body: body, SentAt: time.Now()}, {ID: 2, SenderID: "sender02", Body: "later request", SentAt: time.Now()}}
+	batch := buildInboxDelivery(msgs, "claude", func(string) bool { return false })
+	if len(batch.ids) != 1 || !strings.Contains(batch.text, body) || strings.Contains(batch.text, "later request") {
+		t.Fatalf("oversized first envelope was stalled, truncated or batched: ids=%v bytes=%d", batch.ids, len(batch.text))
+	}
+}
+
+func TestTheEnvelopeBoundsOnlyTheDisplayedSenderName(t *testing.T) {
+	name := strings.Repeat("界", 100)
+	msg := store.InboxMessage{SenderID: "sender01", SenderName: name, Body: "complete request", SentAt: time.Now()}
+	text := inboxEnvelope(msg, "claude", false)
+	if strings.Contains(text, name) || !strings.Contains(text, "complete request") || !strings.Contains(text, `session_id "sender01"`) {
+		t.Fatalf("name not bounded or message identity lost: %s", text)
+	}
+}
+
+func TestInboxLastPromptStaysWithinTheOldBodyLimit(t *testing.T) {
+	var msgs []store.InboxMessage
+	for i := 0; i < 10; i++ {
+		msgs = append(msgs, store.InboxMessage{ID: int64(i + 1), SenderID: "sender01", Body: strings.Repeat("x", 2000), SentAt: time.Now()})
+	}
+	batch := buildInboxDelivery(msgs, "claude", func(string) bool { return false })
+	if len(batch.prompt) > 8000 {
+		t.Fatalf("LastPrompt grew to%d bytes", len(batch.prompt))
+	}
+}
+
+func TestInboxReceiptSurvivesLastPromptFailure(t *testing.T) {
+	m := buildModel(t)
+	path := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	m.store, m.poller.store = st, st
+	sess := spawnedSession(t, m, "ready-tool")
+	settledPane(t, m, sess.ID, "❯")
+	ids := []int64{queueMessage(t, m, sess.ID, "first receipt"), queueMessage(t, m, sess.ID, "second receipt")}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER fail_last_prompt BEFORE UPDATE OF last_prompt ON sessions BEGIN SELECT RAISE(ABORT,'preview write failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	delivered, err := m.poller.maybeDeliverInbox(sess, "❯ ", status.Idle, true)
+	if err == nil || !delivered {
+		t.Fatalf("delivery result=%v, %v", delivered, err)
+	}
+	for _, id := range ids {
+		msg, err := st.Message(id, "sender01")
+		if err != nil || msg.DeliveredAt.IsZero() || !msg.DroppedAt.IsZero() {
+			t.Fatalf("successful paste lost receipt: %+v, %v", msg, err)
+		}
+	}
+	if queued, err := st.QueuedCount(sess.ID); err != nil || queued != 0 {
+		t.Fatalf("successful paste remains queued=%d, %v", queued, err)
+	}
+}
+
+func TestInboxBatchFitsTheExactByteBoundary(t *testing.T) {
+	msgs := []store.InboxMessage{{ID: 1, SenderID: "sender01", SenderName: "author", Body: "first request", SentAt: time.Now()}, {ID: 2, SenderID: "sender02", SenderName: "reviewer", Body: "second request", SentAt: time.Now()}}
+	before := buildInboxDelivery(msgs, "claude", func(string) bool { return false })
+	spare := 8*1024 - len(before.text)
+	if spare < 0 {
+		t.Fatal("fixture cannot fit")
+	}
+	msgs[1].Body += strings.Repeat("x", spare)
+	exact := buildInboxDelivery(msgs, "claude", func(string) bool { return false })
+	if len(exact.ids) != 2 || len(exact.text) != 8*1024 {
+		t.Fatalf("exact boundary count=%d bytes=%d", len(exact.ids), len(exact.text))
+	}
+	msgs[1].Body += "x"
+	overflow := buildInboxDelivery(msgs, "claude", func(string) bool { return false })
+	if len(overflow.ids) != 1 || strings.Contains(overflow.text, msgs[1].Body) {
+		t.Fatalf("overflow was partially delivered: ids=%v bytes=%d", overflow.ids, len(overflow.text))
 	}
 }

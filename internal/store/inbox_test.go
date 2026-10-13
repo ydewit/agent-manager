@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -16,6 +17,119 @@ func message(body string, at time.Time) InboxMessage {
 		Body:        body,
 		Fingerprint: body,
 		SentAt:      at,
+	}
+}
+
+func TestInboxBatchClaimRefusesWhenAnotherManagerHoldsALaterRow(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Now()
+	var ids []int64
+	for _, body := range []string{"first", "second", "third"} {
+		id, err := st.Enqueue(message(body, now), DefaultInboxLimits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if claimed, err := st.ClaimMessage(ids[1], now); err != nil || !claimed {
+		t.Fatalf("competing claim = %v, err %v", claimed, err)
+	}
+	if claimed, err := st.ClaimMessages("target01", ids, now); err != nil || claimed {
+		t.Fatalf("partial batch claim = %v, err %v", claimed, err)
+	}
+	for _, id := range []int64{ids[0], ids[2]} {
+		msg, err := st.Message(id, "sender01")
+		if err != nil || !msg.ClaimedAt.IsZero() {
+			t.Fatalf("losing batch touched message %d: %+v, err %v", id, msg, err)
+		}
+	}
+}
+
+func TestInboxBatchClaimPreservesConcurrentAppendAndIndividualReceipts(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Now()
+	for _, body := range []string{"first", "second"} {
+		if _, err := st.Enqueue(message(body, now), DefaultInboxLimits); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prefix, err := st.HeadMessages("target01", DefaultInboxLimits.QueueCap)
+	if err != nil || len(prefix) != 2 {
+		t.Fatalf("prefix = %+v, err %v", prefix, err)
+	}
+	later, err := st.Enqueue(message("later", now), DefaultInboxLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []int64{prefix[0].ID, prefix[1].ID}
+	if claimed, err := st.ClaimMessages("target01", ids, now); err != nil || !claimed {
+		t.Fatalf("claim = %v, err %v", claimed, err)
+	}
+	if claimed, err := st.ClaimMessages("target01", ids, now); err != nil || claimed {
+		t.Fatalf("repeat claim = %v, err %v", claimed, err)
+	}
+	if err := st.MarkMessagesDelivered(ids, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		msg, err := st.Message(id, "sender01")
+		if err != nil || msg.DeliveredAt.IsZero() || !msg.DroppedAt.IsZero() {
+			t.Fatalf("receipt %d = %+v, err %v", id, msg, err)
+		}
+	}
+	head, queued, err := st.HeadMessage("target01")
+	if err != nil || !queued || head.ID != later || !head.ClaimedAt.IsZero() {
+		t.Fatalf("concurrent append changed: %+v, queued=%v, err %v", head, queued, err)
+	}
+}
+
+func TestInboxBatchOnlyOneConcurrentPollerClaimsThePrefix(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	now := time.Now()
+	var ids []int64
+	for _, body := range []string{"first", "second", "third"} {
+		id, err := first.Enqueue(message(body, now), DefaultInboxLimits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	start := make(chan struct{})
+	type result struct {
+		claimed bool
+		err     error
+	}
+	results := make(chan result, 2)
+	for _, st := range []*Store{first, second} {
+		go func(st *Store) {
+			<-start
+			claimed, err := st.ClaimMessages("target01", ids, now)
+			results <- result{claimed, err}
+		}(st)
+	}
+	close(start)
+	winners := 0
+	for range 2 {
+		got := <-results
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.claimed {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("%d pollers claimed the same prefix", winners)
 	}
 }
 
@@ -376,5 +490,71 @@ func TestClaimPollerSettlesOneHolderUnderARace(t *testing.T) {
 	}
 	if stored != seen[0] {
 		t.Fatalf("stored holder = %q, want the one both managers read, %q", stored, seen[0])
+	}
+}
+
+func TestInboxClaimTransactionAlreadyHoldsTheWriterLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	now := time.Now()
+	id, err := first.Enqueue(message("first", now), DefaultInboxLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.db.Exec("PRAGMA busy_timeout=0"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := first.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	claimed, err := second.ClaimMessage(id, now)
+	if claimed || err == nil || !strings.Contains(err.Error(), "locked") {
+		t.Fatalf("another writer entered before prefix validation: claimed=%v err=%v", claimed, err)
+	}
+	msg, err := second.Message(id, "sender01")
+	if err != nil || !msg.ClaimedAt.IsZero() {
+		t.Fatalf("blocked writer changed receipt: %+v, %v", msg, err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := second.ClaimMessages("target01", []int64{id}, now); err != nil || !claimed {
+		t.Fatalf("claim after release=%v, %v", claimed, err)
+	}
+}
+
+func TestInboxClaimFailureRollsBackEveryReceipt(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Now()
+	var ids []int64
+	for _, body := range []string{"first", "second", "third"} {
+		id, err := st.Enqueue(message(body, now), DefaultInboxLimits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if _, err := st.db.Exec(`CREATE TRIGGER fail_claim BEFORE UPDATE OF claimed_at ON session_inbox WHEN NEW.body='third' BEGIN SELECT RAISE(ABORT,'claim write failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := st.ClaimMessages("target01", ids, now); err == nil || ok {
+		t.Fatalf("claim did not fail: %v, %v", ok, err)
+	}
+	for _, id := range ids {
+		msg, err := st.Message(id, "sender01")
+		if err != nil || !msg.ClaimedAt.IsZero() {
+			t.Fatalf("failed claim leaked receipt%d: %+v, %v", id, msg, err)
+		}
 	}
 }
